@@ -1,4 +1,6 @@
 #!/bin/bash
+set -euo pipefail
+set -x
 
 ENVIRONMENT=$1
 CLUSTER_ID=$2
@@ -30,6 +32,12 @@ aws_cli_setup() {
     info "Using access key '$KEY_ID'."
 
     echo -e "${KEY_ID}\n${SECRET_KEY}\nus-east-1\njson\n" | aws configure --profile $PROFILE_NAME 2>/dev/null >/dev/null
+}
+
+get_aws_user_name() {
+    AWS_USERNAME=$1
+    USER_ID=$(AWS_PROFILE=$AWS_PROFILE aws sts get-caller-identity | jq -r '.UserId')
+    KEY_USERNAME=$(AWS_PROFILE=$AWS_PROFILE aws iam list-users | jq -r ".Users | select ( .UserId == \"$USER_ID\" ) | .UserName")
 }
 
 iam_user_create_accesskey() {
@@ -91,9 +99,14 @@ update_aws_secret() {
 }
 
 NAMESPACE=$(ssh root@hive-$ENVIRONMENT-master "oc get clusterdeployment --all-namespaces --no-headers | grep \"$CLUSTER_ID \" | awk '{print \$1}'")
+if ssh root@hive-$ENVIRONMENT-master "oc get secrets -n $NAMESPACE aws"; then
+    CREDENTIALS_SECRET_NAME="aws"
+else
+    CREDENTIALS_SECRET_NAME="byoc"
+fi
 
-ACCESS_KEY_ID=$(ssh root@hive-$ENVIRONMENT-master "oc get secrets -n $NAMESPACE aws -o json | jq -r '.data.aws_access_key_id' | base64 --decode")
-SECRET_ACCESS_KEY=$(ssh root@hive-$ENVIRONMENT-master "oc get secrets -n $NAMESPACE aws -o json | jq -r '.data.aws_secret_access_key' | base64 --decode")
+ACCESS_KEY_ID=$(ssh root@hive-$ENVIRONMENT-master "oc get secrets -n $NAMESPACE $CREDENTIALS_SECRET_NAME -o json | jq -r '.data.aws_access_key_id' | base64 --decode")
+SECRET_ACCESS_KEY=$(ssh root@hive-$ENVIRONMENT-master "oc get secrets -n $NAMESPACE $CREDENTIALS_SECRET_NAME -o json | jq -r '.data.aws_secret_access_key' | base64 --decode")
 AWS_PROFILE=$ENVIRONMENT-$CLUSTER_ID
 aws_cli_setup $ACCESS_KEY_ID $SECRET_ACCESS_KEY $AWS_PROFILE
 info "Retrived original AccessKey."
@@ -101,7 +114,7 @@ info "Retrived original AccessKey."
 ######################################
 ### Create new credentials for osdManagedAdmin
 
-iam_user_create_accesskey "osdManagedAdmin"
+iam_user_create_accesskey $KEY_USERNAME
 
 # switch to new profile so we can delete the old one
 AWS_PROFILE=$ENVIRONMENT-$CLUSTER_ID-new
@@ -116,14 +129,14 @@ update_aws_secret aws-account-operator $SECRET_NAME
 info "Replaced AWS Account Operator Secret."
 
 # Replace aws secret (in cluster's hive namespace)
-update_aws_secret $NAMESPACE aws
+update_aws_secret $NAMESPACE $CREDENTIALS_SECRET_NAME
 
 info "Replaced Hive AWS Secret."
 
 ######################################
 ### Delete old credentials for osdManagedAdmin
 
-iam_user_delete_accesskey "osdManagedAdmin" "$ACCESS_KEY_ID"
+iam_user_delete_accesskey $KEY_USERNAME "$ACCESS_KEY_ID"
 
 ######################################
 ### Changes on the OSD cluster
@@ -175,15 +188,7 @@ do
         S=$(cat $F | jq -r '.spec.secretRef.name')
 
         # cleanup any pods that referenced the secret (note we're ignoring namespace, exceptionally small risk)
-        IFS_OLD=$IFS
-        IFS=
-        for X in $(KUBECONFIG=${TEMP_DIR}/kubeconfig-${NAMESPACE} oc get pods --all-namespaces -o json | jq -r ".items[] | select(.spec.volumes[].secret.secretName == \"$S\") | \"oc -n \" + .metadata.namespace + \" delete pod \" + .metadata.name");
-        do
-            X="KUBECONFIG=${TEMP_DIR}/kubeconfig-${NAMESPACE} $X"
-            # do not wait, just move on
-            eval $X &
-        done
-        IFS=$IFS_OLD
+        KUBECONFIG=${TEMP_DIR}/kubeconfig-${NAMESPACE} oc get pods -n $NS -o json | jq -r ".items[] | select(.spec.volumes[].secret.secretName == \"$S\") | .metadata.name" |  parallel --will-cite -n10 "KUBECONFIG=${TEMP_DIR}/kubeconfig-${NAMESPACE} oc -n ${NS} delete pod"
 
         info "Rotated SRE managed CredentialsRequest '$CR' in '$NS'."
     done
